@@ -964,6 +964,19 @@
   .opt-x{ border:none; background:none; cursor:pointer; color:var(--text-faint); font-size:17px; line-height:1; padding:2px 5px; border-radius:4px; }
   .opt-x:hover{ color:var(--danger); background:var(--danger-light); }
   #opt-add{ margin-top:10px; }
+
+  th.col-th{ position:relative; }
+  .col-resize{
+    position:absolute; top:0; right:-4px; width:9px; height:100%; cursor:col-resize; z-index:3; touch-action:none;
+  }
+  .col-resize::after{
+    content:''; position:absolute; left:4px; top:20%; bottom:20%; width:2px; border-radius:1px;
+    background:var(--accent); opacity:0; transition:opacity 0.12s;
+  }
+  th.col-th:hover .col-resize::after{ opacity:0.35; }
+  .col-resize:hover::after, .col-resize.active::after{ opacity:1; }
+  body.resizing, body.resizing *{ cursor:col-resize !important; user-select:none !important; }
+  th.spacer, td.spacer{ padding:0; }
 </style>
 </head>
 <body>
@@ -1130,6 +1143,7 @@
     {bg:'#E1F5EE', fg:'#085041'}, {bg:'#FAECE7', fg:'#712B13'}
   ];
   var POSITIONS = ['GK', 'DF', 'SW', 'CB', 'LB', 'RB', 'LWB', 'RWB', 'DM', 'MF', 'CM', 'AM', 'LM', 'RM', 'LW', 'RW', 'CF', 'ST', 'FW'];
+  var MIN_COL_W = 60, MAX_COL_W = 800;
 
   var DB_NAME = 'tables-app-db';
   var DB_STORE = 'kv';
@@ -1546,6 +1560,8 @@
     var cols = Array.isArray(t.columns) ? t.columns : [];
     t.columns = cols.filter(function(c){ return c && c.id && TYPES[c.type]; }).map(function(c){
       c.name = String(c.name || 'Untitled');
+      if (typeof c.width === 'number' && isFinite(c.width)) c.width = Math.max(MIN_COL_W, Math.min(MAX_COL_W, Math.round(c.width)));
+      else delete c.width;
       if (isOptionType(c.type)){
         c.options = (Array.isArray(c.options) ? c.options : []).map(function(o, i){
           return {id: o.id || uid(), label: String(o.label == null ? '' : o.label), color: (+o.color || 0) % TAG_PALETTE.length, img: o.img || ''};
@@ -1887,7 +1903,8 @@
     });
   }
 
-  function colWidth(c){ return TYPES[c.type].width + (c.id === table.primaryId ? 40 : 0); }
+  function defaultColWidth(c){ return TYPES[c.type].width + (c.id === table.primaryId ? 40 : 0); }
+  function colWidth(c){ return (typeof c.width === 'number' && c.width >= MIN_COL_W) ? c.width : defaultColWidth(c); }
 
   function cellInner(row, col, maxMetric){
     var v = row.c[col.id];
@@ -1939,22 +1956,20 @@
     var maxMetric = 0;
     if (table.metricId) table.rows.forEach(function(r){ var m = metricOf(r); if (m != null && m > maxMetric) maxMetric = m; });
 
-    var totalW = 56;
-    table.columns.forEach(function(c){ totalW += colWidth(c); });
-    var colspan = table.columns.length + 1;
+    var colspan = table.columns.length + 2;
 
-    var html = '<table class="grid" style="width:' + totalW + 'px;min-width:100%;"><colgroup>';
+    var html = '<table class="grid" style="width:100%;"><colgroup>';
     table.columns.forEach(function(c){ html += '<col style="width:' + colWidth(c) + 'px">'; });
-    html += '<col style="width:56px"></colgroup><thead><tr>';
+    html += '<col style="width:56px"><col></colgroup><thead><tr>';
     table.columns.forEach(function(c){
       var sorted = sort && sort.colId === c.id;
       html += '<th class="col-th' + (sorted ? ' active-sort' : '') + '" data-col="' + esc(c.id) + '" title="' + esc(TYPES[c.type].label) + ' column \u2014 click for options">' +
         '<div class="th-inner"><span class="th-glyph">' + TYPES[c.type].glyph + '</span><span class="th-name">' + esc(c.name) + '</span>' +
         (c.id === table.metricId ? '<span class="th-badge" title="Used for rankings and trends">\u2605</span>' : '') +
         (sorted ? '<span class="sort-arrow">' + (sort.dir === 'desc' ? '\u2193' : '\u2191') + '</span>' : '') +
-        '</div></th>';
+        '</div><span class="col-resize" data-resize="' + esc(c.id) + '" title="Drag to resize \u00B7 double-click to reset"></span></th>';
     });
-    html += '<th class="add-col" id="add-col-th" title="Add a column"><span>+</span></th></tr></thead><tbody>';
+    html += '<th class="add-col" id="add-col-th" title="Add a column"><span>+</span></th><th class="spacer"></th></tr></thead><tbody>';
 
     if (!table.rows.length){
       html += '<tr><td colspan="' + colspan + '"><div class="empty-state"><h3>No rows yet</h3><p>Add your first row to get started.</p><button class="btn btn-primary" id="empty-add-btn">+ Add row</button></div></td></tr>';
@@ -1978,7 +1993,7 @@
           table.columns.forEach(function(c){
             html += '<td data-col="' + esc(c.id) + '">' + cellInner(r, c, maxMetric) + '</td>';
           });
-          html += '<td><div class="row-actions"><button class="del-btn" data-del="' + esc(r.id) + '" title="Delete row" aria-label="Delete row">' + SVG_TRASH + '</button></div></td></tr>';
+          html += '<td><div class="row-actions"><button class="del-btn" data-del="' + esc(r.id) + '" title="Delete row" aria-label="Delete row">' + SVG_TRASH + '</button></div></td><td class="spacer"></td></tr>';
         });
       });
     }
@@ -2243,6 +2258,7 @@
     if (col.type === 'number') html += '<button class="pop-item" data-act="metric">' + (isMetric ? '\u2605 Used for rankings & trends \u2014 stop using' : 'Use for rankings & trends') + '</button>';
     if (col.type === 'text' && col.id !== table.primaryId) html += '<button class="pop-item" data-act="primary">Use as the name column</button>';
     html += '<button class="pop-item" data-act="sort-asc">Sort ascending</button><button class="pop-item" data-act="sort-desc">Sort descending</button>';
+    if (col.width) html += '<button class="pop-item" data-act="reset-width">Reset column width</button>';
     if (view.sortColId === col.id) html += '<button class="pop-item" data-act="sort-clear">Clear sort</button>';
     var idx = table.columns.indexOf(col);
     if (idx > 0) html += '<button class="pop-item" data-act="left">Move left</button>';
@@ -2285,6 +2301,7 @@
       if (act === 'primary'){ table.primaryId = col.id; closePopover(); scheduleSave(); render(); return; }
       if (act === 'sort-asc' || act === 'sort-desc'){ view.sortColId = col.id; view.sortDir = act === 'sort-asc' ? 'asc' : 'desc'; closePopover(); render(); return; }
       if (act === 'sort-clear'){ view.sortColId = ''; closePopover(); render(); return; }
+      if (act === 'reset-width'){ delete col.width; closePopover(); scheduleSave(); render(); return; }
       if (act === 'left' || act === 'right'){
         var i = table.columns.indexOf(col), j = act === 'left' ? i - 1 : i + 1;
         table.columns.splice(i, 1); table.columns.splice(j, 0, col);
@@ -3175,8 +3192,53 @@
   }
 
   /* ================= wiring ================= */
+  var suppressClickUntil = 0;
+  function startColumnResize(e){
+    var handle = e.target.closest('.col-resize');
+    if (!handle || (e.button != null && e.button !== 0)) return;
+    var col = colById(handle.getAttribute('data-resize'));
+    if (!col) return;
+    e.preventDefault();
+    e.stopPropagation();
+    closePopover();
+    var colEl = document.querySelectorAll('#table-card colgroup col')[table.columns.indexOf(col)];
+    var startX = e.clientX, startW = colWidth(col), moved = false;
+    handle.classList.add('active');
+    document.body.classList.add('resizing');
+    function move(ev){
+      var w = Math.max(MIN_COL_W, Math.min(MAX_COL_W, Math.round(startW + ev.clientX - startX)));
+      if (w === col.width) return;
+      col.width = w;
+      moved = true;
+      if (colEl) colEl.style.width = w + 'px';
+    }
+    function up(){
+      document.removeEventListener('pointermove', move);
+      document.removeEventListener('pointerup', up);
+      document.removeEventListener('pointercancel', up);
+      handle.classList.remove('active');
+      document.body.classList.remove('resizing');
+      suppressClickUntil = Date.now() + 300;
+      if (moved) scheduleSave();
+    }
+    document.addEventListener('pointermove', move);
+    document.addEventListener('pointerup', up);
+    document.addEventListener('pointercancel', up);
+  }
+
   function wire(){
+    $('table-card').addEventListener('pointerdown', startColumnResize);
+    $('table-card').addEventListener('dblclick', function(e){
+      var handle = e.target.closest('.col-resize');
+      if (!handle) return;
+      var col = colById(handle.getAttribute('data-resize'));
+      if (!col || col.width == null) return;
+      delete col.width;
+      scheduleSave();
+      render();
+    });
     $('table-card').addEventListener('click', function(e){
+      if (e.target.closest('.col-resize') || Date.now() < suppressClickUntil) return;
       var th = e.target.closest('th.col-th');
       if (th){ var c = colById(th.getAttribute('data-col')); if (c) openColumnMenu(th, c); return; }
       if (e.target.closest('#add-col-th')){ openAddColumn($('add-col-th')); return; }
