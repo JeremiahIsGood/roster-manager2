@@ -1148,7 +1148,6 @@
   var DB_NAME = 'tables-app-db';
   var DB_STORE = 'kv';
   var META_KEY = 'tables-app.meta.v1';
-  function tableKey(id){ return 'tables-app.table.v1.' + id; }
   var storageMode = null;
   var storageErrorDetail = '';
   var memoryStore = {};
@@ -1162,14 +1161,19 @@
   var rankingsState = {open:false, tab:'row', sortField:'m', sortDir:'desc', dateStr:''};
   var trendState = {open:false, kind:'row', series:[], metric:'total', zero:false, preset:'all', fromStr:'', toStr:''};
   var tableMenuOpen = false;
+  var dataVersion = 0;        // bumped on every data change; used to cache sorted/filtered views
+  var tableToken = 0;         // bumped whenever a different table is loaded
 
   /* ================= utils ================= */
   function $(id){ return document.getElementById(id); }
   function uid(){ return 'x' + (idCounter++) + Math.random().toString(36).slice(2, 7); }
+  var ESC_RE = /[&<>"']/;
+  var ESC_RE_G = /[&<>"']/g;
+  var ESC_MAP = {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'};
   function esc(str){
-    var d = document.createElement('div');
-    d.textContent = str == null ? '' : String(str);
-    return d.innerHTML;
+    if (str == null) return '';
+    str = String(str);
+    return ESC_RE.test(str) ? str.replace(ESC_RE_G, function(c){ return ESC_MAP[c]; }) : str;
   }
   function fmtDate(iso){
     if (!iso) return '';
@@ -1467,6 +1471,193 @@
   }
 
 
+  /* ================= batched storage ================= */
+  function idbBatch(puts, dels){
+    return idbOpen().then(function(db){
+      return new Promise(function(resolve, reject){
+        var tx = db.transaction(DB_STORE, 'readwrite');
+        var st = tx.objectStore(DB_STORE);
+        puts.forEach(function(p){ st.put(p[1], p[0]); });
+        dels.forEach(function(k){ st.delete(k); });
+        tx.oncomplete = function(){ resolve(); };
+        tx.onerror = function(){ reject(tx.error || new Error('IndexedDB write failed.')); };
+        tx.onabort = function(){ reject(tx.error || new Error('IndexedDB write was aborted.')); };
+      });
+    });
+  }
+
+  /* many writes/deletes in one go: one IndexedDB transaction, or key by key on the fallbacks */
+  function writeBatchChain(puts, dels){
+    if (!puts.length && !dels.length) return Promise.resolve(true);
+    return idbBatch(puts, dels).then(function(){
+      storageMode = 'indexeddb';
+      setStorageWarning('indexeddb');
+      return true;
+    }).catch(function(err){
+      console.warn('IndexedDB save failed, falling back:', err);
+      storageErrorDetail = describeErr(err);
+      function tryStore(getStore, mode){
+        try {
+          var store = getStore();
+          puts.forEach(function(p){ store.setItem(p[0], p[1]); });
+          dels.forEach(function(k){ store.removeItem(k); });
+          storageMode = mode;
+          setStorageWarning(mode);
+          return true;
+        } catch (e){
+          storageErrorDetail = describeErr(e);
+          return false;
+        }
+      }
+      if (tryStore(function(){ return window.localStorage; }, 'local')) return true;
+      if (tryStore(function(){ return window.sessionStorage; }, 'session')) return true;
+      puts.forEach(function(p){ memoryStore[p[0]] = p[1]; });
+      dels.forEach(function(k){ delete memoryStore[k]; });
+      storageMode = 'memory';
+      setStorageWarning('memory');
+      return false;
+    });
+  }
+
+  /* read many keys at once -> {key: value} (missing keys are simply absent) */
+  function readManyChain(keys){
+    if (!keys.length) return Promise.resolve({});
+    return idbOpen().then(function(db){
+      return new Promise(function(resolve, reject){
+        var out = {};
+        var tx = db.transaction(DB_STORE, 'readonly');
+        var st = tx.objectStore(DB_STORE);
+        keys.forEach(function(k){
+          var rq = st.get(k);
+          rq.onsuccess = function(){ if (rq.result !== undefined) out[k] = rq.result; };
+        });
+        tx.oncomplete = function(){ resolve(out); };
+        tx.onerror = function(){ reject(tx.error || new Error('IndexedDB read failed.')); };
+        tx.onabort = function(){ reject(tx.error || new Error('IndexedDB read was aborted.')); };
+      });
+    }).then(function(out){
+      storageMode = 'indexeddb';
+      return out;
+    }).catch(function(err){
+      console.warn('IndexedDB unavailable, falling back to browser storage:', err);
+      storageErrorDetail = describeErr(err);
+      var out = {};
+      keys.forEach(function(k){ var v = readSyncFallbackKey(k); if (v != null) out[k] = v; });
+      return out;
+    });
+  }
+
+  /* ================= images =================
+     Pictures are stored once, under a short id derived from their content, and shown through a
+     single blob: URL. Tables and dropdown options only keep the id. */
+  var IMG_MAX = 96;                // longest side, in pixels, of stored pictures
+  var imageData = {};              // id -> data URL (kept so it can be saved / exported)
+  var imageUrls = {};              // id -> blob: URL used by <img> tags
+
+  function isImageId(v){ return typeof v === 'string' && v.indexOf('img_') === 0; }
+  function isDataImage(v){ return typeof v === 'string' && v.indexOf('data:image') === 0; }
+
+  function hashString(str){
+    var h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+    for (var i = 0; i < str.length; i++){
+      var ch = str.charCodeAt(i);
+      h1 = Math.imul(h1 ^ ch, 2654435761);
+      h2 = Math.imul(h2 ^ ch, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return 4294967296 * (2097151 & h2) + (h1 >>> 0);
+  }
+
+  function internImage(dataUrl){
+    var id = 'img_' + hashString(dataUrl).toString(36) + dataUrl.length.toString(36);
+    if (!imageData[id]) imageData[id] = dataUrl;
+    return id;
+  }
+
+  function dataUrlToBlob(du){
+    var comma = du.indexOf(',');
+    var mime = du.slice(5, comma).split(';')[0] || 'image/png';
+    var bin = atob(du.slice(comma + 1));
+    var arr = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return new Blob([arr], {type: mime});
+  }
+
+  /* what to put in an <img src>: the same short blob URL every time for the same picture */
+  function imgSrc(v){
+    if (!v) return '';
+    if (isDataImage(v)) return v;
+    if (imageUrls[v]) return imageUrls[v];
+    var data = imageData[v];
+    if (!data) return '';
+    var url = data;
+    try { url = URL.createObjectURL(dataUrlToBlob(data)); } catch (e){ url = data; }
+    imageUrls[v] = url;
+    return url;
+  }
+
+  function encodeImage(img, maxDim){
+    var w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+    var scale = Math.min(1, maxDim / Math.max(w, h));
+    var tw = Math.max(1, Math.round(w * scale)), th = Math.max(1, Math.round(h * scale));
+    var canvas = document.createElement('canvas');
+    canvas.width = tw; canvas.height = th;
+    var ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, tw, th);
+    ctx.drawImage(img, 0, 0, tw, th);
+    var out = canvas.toDataURL('image/webp', 0.85);              // keeps transparency, much smaller than PNG
+    if (out.indexOf('data:image/webp') !== 0) out = canvas.toDataURL('image/png');   // browsers that can't encode WebP
+    return out;
+  }
+
+  /* re-encode an existing picture at the compact size; keeps the original if that isn't smaller */
+  function shrinkDataUrl(dataUrl, maxDim){
+    return new Promise(function(resolve){
+      var done = false;
+      function fin(v){ if (!done){ done = true; clearTimeout(timer); resolve(v); } }
+      var timer = setTimeout(function(){ fin(dataUrl); }, 4000);
+      try {
+        var img = new Image();
+        img.onload = function(){
+          try {
+            var out = encodeImage(img, maxDim);
+            fin(out && out.length < dataUrl.length ? out : dataUrl);
+          } catch (e){ fin(dataUrl); }
+        };
+        img.onerror = function(){ fin(dataUrl); };
+        img.src = dataUrl;
+      } catch (e){ fin(dataUrl); }
+    });
+  }
+
+  /* swap any inline data-URL pictures in a table for compact, shared image ids */
+  function internInlineImages(t){
+    var urls = {};
+    t.columns.forEach(function(c){
+      if (c.options) c.options.forEach(function(o){ if (isDataImage(o.img)) urls[o.img] = true; });
+    });
+    var imgCols = t.columns.filter(function(c){ return c.type === 'image'; });
+    t.rows.forEach(function(r){
+      imgCols.forEach(function(c){ if (isDataImage(r.c[c.id])) urls[r.c[c.id]] = true; });
+    });
+    var list = Object.keys(urls);
+    if (!list.length) return Promise.resolve(t);
+    return Promise.all(list.map(function(u){
+      return shrinkDataUrl(u, IMG_MAX).then(function(nu){ return [u, internImage(nu)]; });
+    })).then(function(pairs){
+      var map = {};
+      pairs.forEach(function(p){ map[p[0]] = p[1]; });
+      t.columns.forEach(function(c){
+        if (c.options) c.options.forEach(function(o){ if (map[o.img]) o.img = map[o.img]; });
+      });
+      t.rows.forEach(function(r){
+        imgCols.forEach(function(c){ if (map[r.c[c.id]]) r.c[c.id] = map[r.c[c.id]]; });
+      });
+      return t;
+    });
+  }
+
   /* ================= model helpers ================= */
   function colById(id){ return table.columns.find(function(c){ return c.id === id; }) || null; }
   function primaryCol(){ return colById(table.primaryId) || table.columns[0] || null; }
@@ -1488,7 +1679,7 @@
   }
   function tagHtml(o){
     return '<span class="tag" style="' + tagStyle(o) + '">' +
-      (o.img ? '<img class="tag-img" src="' + esc(o.img) + '" alt="">' : '') + esc(o.label) + '</span>';
+      (o.img && imgSrc(o.img) ? '<img class="tag-img" src="' + esc(imgSrc(o.img)) + '" alt="">' : '') + esc(o.label) + '</span>';
   }
 
   function cellText(row, col){
@@ -1517,7 +1708,7 @@
     if (!key) return '';
     if (col.type === 'country') return countryFlag(key);
     var o = optByLabel(col, key);
-    return (o && o.img) ? '<img class="club-emblem" src="' + esc(o.img) + '" alt="">' : '';
+    return (o && o.img && imgSrc(o.img)) ? '<img class="club-emblem" src="' + esc(imgSrc(o.img)) + '" alt="">' : '';
   }
   function metricOf(row){
     var v = table.metricId ? row.c[table.metricId] : null;
@@ -1533,7 +1724,7 @@
       case 'checkbox': return v === true || v === 'true';
       case 'select': return optById(col, v) ? v : '';
       case 'multiselect': return Array.isArray(v) ? v.filter(function(id){ return optById(col, id); }) : [];
-      case 'image': return (typeof v === 'string' && v.indexOf('data:image') === 0) ? v : '';
+      case 'image': return (isImageId(v) || isDataImage(v)) ? v : '';
       case 'country': return typeof v === 'string' ? normalizeAssociationName(v) : '';
     }
     return '';
@@ -1584,7 +1775,9 @@
     var met = t.columns.find(function(c){ return c.id === t.metricId && c.type === 'number'; });
     t.metricId = met ? met.id : null;
     t.history = (t.history && typeof t.history === 'object') ? t.history : {};
-    t.v = 1;
+    Object.keys(t.history).forEach(function(id){ if (!Array.isArray(t.history[id])) delete t.history[id]; });
+    t.images = Array.isArray(t.images) ? t.images.filter(isImageId) : [];
+    t.v = 2;
     return t;
   }
 
@@ -1597,18 +1790,51 @@
   function recordHistory(row){
     if (!table.metricId) return;
     var s = snapshotOf(row);
-    var arr = table.history[row.id] || (table.history[row.id] = []);
+    var arr = table.history[row.id];
+    if (!arr){ arr = table.history[row.id] = []; markMeta(); }
     var last = arr[arr.length - 1];
     if (last && !last.del && last.label === s.label && last.m === s.m && JSON.stringify(last.g) === JSON.stringify(s.g)) return;
     arr.push({t: Date.now(), label: s.label, m: s.m, g: s.g});
+    markHist(row.id);
+    if (arr.length > 40 && arr.length % 20 === 0){
+      var packed = compactHistArr(arr, Date.now());
+      if (packed) table.history[row.id] = packed;
+    }
   }
   function recordAllHistory(){ table.rows.forEach(recordHistory); }
+  function resetHistory(){
+    Object.keys(table.history).forEach(markHist);
+    table.history = {};
+    markMeta();
+  }
   function markDeleted(row){
     if (!table.metricId) return;
     var arr = table.history[row.id];
     if (!arr || !arr.length) return;
     var s = snapshotOf(row);
     arr.push({t: Date.now(), label: s.label, m: s.m, g: s.g, del: true});
+    markHist(row.id);
+  }
+
+  /* Keep every snapshot for the last two weeks; beyond that keep only the last snapshot of each
+     day. "As of" rankings read end-of-day state, so this loses nothing they can show. */
+  var HIST_FULL_MS = 14 * 86400000;
+  function compactHistArr(arr, now){
+    if (arr.length < 3) return null;
+    var cutoff = now - HIST_FULL_MS;
+    var out = [];
+    for (var i = 0; i < arr.length; i++){
+      var s = arr[i], next = arr[i + 1];
+      if (s.t >= cutoff || !next || next.t >= cutoff || dateToStr(new Date(next.t)) !== dateToStr(new Date(s.t))) out.push(s);
+    }
+    return out.length < arr.length ? out : null;
+  }
+  function compactAllHistory(){
+    var now = Date.now();
+    Object.keys(table.history).forEach(function(id){
+      var packed = compactHistArr(table.history[id], now);
+      if (packed){ table.history[id] = packed; markHist(id); }
+    });
   }
   function latestSnapAt(arr, T){
     var lo = 0, hi = arr.length - 1, found = -1;
@@ -1667,7 +1893,7 @@
           var nm = normalizeAssociationName(String(text).trim());
           var hit = countryOptions.find(function(c){ return c.name.toLowerCase() === nm.toLowerCase(); });
           nv = hit ? hit.name : ''; break;
-        case 'image': nv = (typeof v === 'string' && v.indexOf('data:image') === 0) ? v : ''; break;
+        case 'image': nv = (isImageId(v) || isDataImage(v)) ? v : ''; break;
         default: nv = '';
       }
       r.c[col.id] = nv;
@@ -1756,28 +1982,117 @@
     return normalizeTable(t);
   }
 
-  /* ================= persistence ================= */
-  var saveTimer = null, dirty = false;
+  /* ================= persistence =================
+     A table is stored as many small records instead of one big blob:
+       meta      columns, settings, the list of row ids, and which images / histories exist
+       r.<id>    one record per row
+       h.<id>    one history record per row
+       i.<id>    one record per image
+     Only the records that changed are rewritten on save. */
+  function tkey(tid, part){ return 'tables-app.t2.' + tid + '.' + part; }
+  function legacyTableKey(id){ return 'tables-app.table.v1.' + id; }
+
+  function freshDirty(){ return {any: false, meta: false, rows: {}, hist: {}}; }
+  var dirty = freshDirty();
+  var saveTimer = null;
+  function markMeta(){ dirty.meta = true; dirty.any = true; }
+  function markRow(id){ dirty.rows[id] = true; dirty.any = true; }
+  function markHist(id){ dirty.hist[id] = true; dirty.any = true; }
+  function markAllRows(){ table.rows.forEach(function(r){ dirty.rows[r.id] = true; }); dirty.any = true; }
+  function markAllHist(){ Object.keys(table.history).forEach(markHist); }
+
   function scheduleSave(){
-    dirty = true;
+    dataVersion++;
+    markMeta();
     clearTimeout(saveTimer);
     saveTimer = setTimeout(flushSave, 350);
   }
+
+  function referencedImages(t){
+    var refs = {};
+    t.columns.forEach(function(c){
+      if (c.options) c.options.forEach(function(o){ if (isImageId(o.img)) refs[o.img] = true; });
+    });
+    var imgCols = t.columns.filter(function(c){ return c.type === 'image'; });
+    if (imgCols.length){
+      t.rows.forEach(function(r){
+        imgCols.forEach(function(c){ var v = r.c[c.id]; if (isImageId(v)) refs[v] = true; });
+      });
+    }
+    return refs;
+  }
+
+  function metaOf(t){
+    return {
+      v: 2, columns: t.columns, primaryId: t.primaryId, metricId: t.metricId,
+      rowIds: t.rows.map(function(r){ return r.id; }),
+      histIds: Object.keys(t.history).filter(function(id){ return t.history[id].length; }),
+      images: t.images || []
+    };
+  }
+
+  /* every record of a table (used for brand-new tables, imports and migrations) */
+  function fullPuts(tid, t){
+    var refs = referencedImages(t);
+    t.images = Object.keys(refs).filter(function(id){ return imageData[id]; });
+    var puts = [[tkey(tid, 'meta'), JSON.stringify(metaOf(t))]];
+    t.rows.forEach(function(r){ puts.push([tkey(tid, 'r.' + r.id), JSON.stringify(r.c)]); });
+    Object.keys(t.history).forEach(function(id){
+      if (t.history[id].length) puts.push([tkey(tid, 'h.' + id), JSON.stringify(t.history[id])]);
+    });
+    t.images.forEach(function(id){ puts.push([tkey(tid, 'i.' + id), imageData[id]]); });
+    return puts;
+  }
+  function allKeysOf(tid, t){
+    var keys = [tkey(tid, 'meta'), legacyTableKey(tid)];
+    t.rows.forEach(function(r){ keys.push(tkey(tid, 'r.' + r.id)); });
+    Object.keys(t.history).forEach(function(id){ keys.push(tkey(tid, 'h.' + id)); });
+    (t.images || []).forEach(function(id){ keys.push(tkey(tid, 'i.' + id)); });
+    return keys;
+  }
+
   function saveTableNow(){
-    var payload;
-    try { payload = JSON.stringify(table); }
-    catch (err){
+    var t = table, tid = currentTableId;
+    if (!t || !tid) return Promise.resolve(true);
+    var d = dirty;
+    dirty = freshDirty();
+    var puts = [], dels = [];
+    try {
+      // images: write the new ones, drop the ones nothing uses any more
+      var refs = referencedImages(t);
+      var known = {};
+      (t.images || []).forEach(function(id){ known[id] = true; });
+      var keep = [];
+      Object.keys(refs).forEach(function(id){
+        if (!imageData[id]) return;
+        keep.push(id);
+        if (!known[id]) puts.push([tkey(tid, 'i.' + id), imageData[id]]);
+      });
+      (t.images || []).forEach(function(id){ if (!refs[id]) dels.push(tkey(tid, 'i.' + id)); });
+      if (keep.length !== (t.images || []).length || puts.length || dels.length){ t.images = keep; d.meta = true; }
+      var byId = {};
+      t.rows.forEach(function(r){ byId[r.id] = r; });
+      Object.keys(d.rows).forEach(function(id){
+        if (byId[id]) puts.push([tkey(tid, 'r.' + id), JSON.stringify(byId[id].c)]);
+        else dels.push(tkey(tid, 'r.' + id));
+      });
+      Object.keys(d.hist).forEach(function(id){
+        var h = t.history[id];
+        if (h && h.length) puts.push([tkey(tid, 'h.' + id), JSON.stringify(h)]);
+        else dels.push(tkey(tid, 'h.' + id));
+      });
+      if (d.meta) puts.push([tkey(tid, 'meta'), JSON.stringify(metaOf(t))]);
+    } catch (err){
       storageMode = 'memory'; storageErrorDetail = describeErr(err);
       setStorageWarning('memory');
       return Promise.resolve(false);
     }
-    return writeKeyChain(tableKey(currentTableId), payload);
+    return writeBatchChain(puts, dels);
   }
   function flushSave(){
     clearTimeout(saveTimer);
     saveTimer = null;
-    if (!dirty || !table || !currentTableId) return Promise.resolve(true);
-    dirty = false;
+    if (!dirty.any || !table || !currentTableId) return Promise.resolve(true);
     return saveTableNow();
   }
   function saveMeta(){
@@ -1786,25 +2101,83 @@
     catch (err){ return Promise.resolve(false); }
     return writeKeyChain(META_KEY, payload);
   }
+
+  function parseJson(s, fallback){ try { return JSON.parse(s); } catch (e){ return fallback; } }
+
   function loadTable(id){
-    return readKeyChain(tableKey(id)).then(function(stored){
-      var t = null;
-      if (stored){ try { t = JSON.parse(stored); } catch (e){ t = null; } }
-      return normalizeTable(t || makeTemplate('blank'));
+    return readKeyChain(tkey(id, 'meta')).then(function(metaStr){
+      var meta = metaStr ? parseJson(metaStr, null) : null;
+      if (meta && Array.isArray(meta.columns)) return loadFromRecords(id, meta);
+      return readKeyChain(legacyTableKey(id)).then(function(old){
+        var parsed = old ? parseJson(old, null) : null;
+        if (!parsed){
+          var blank = normalizeTable(makeTemplate('blank'));
+          blank._needsFullWrite = true;
+          return blank;
+        }
+        // a table saved by the first version of this app: one big record with images inline
+        var t = normalizeTable(parsed);
+        return internInlineImages(t).then(function(){
+          t._needsFullWrite = true;
+          t._legacyKey = legacyTableKey(id);
+          return t;
+        });
+      });
     });
   }
+
+  function loadFromRecords(id, meta){
+    var rowIds = meta.rowIds || [], histIds = meta.histIds || [], imgIds = meta.images || [];
+    var keys = rowIds.map(function(r){ return tkey(id, 'r.' + r); })
+      .concat(histIds.map(function(h){ return tkey(id, 'h.' + h); }))
+      .concat(imgIds.map(function(i){ return tkey(id, 'i.' + i); }));
+    return readManyChain(keys).then(function(map){
+      var t = {columns: meta.columns, primaryId: meta.primaryId, metricId: meta.metricId, rows: [], history: {}, images: []};
+      rowIds.forEach(function(rid){
+        var s = map[tkey(id, 'r.' + rid)];
+        var c = s == null ? null : parseJson(s, null);
+        if (c) t.rows.push({id: rid, c: c});
+      });
+      histIds.forEach(function(hid){
+        var s = map[tkey(id, 'h.' + hid)];
+        var h = s == null ? null : parseJson(s, null);
+        if (Array.isArray(h)) t.history[hid] = h;
+      });
+      imgIds.forEach(function(iid){
+        var s = map[tkey(id, 'i.' + iid)];
+        if (typeof s === 'string'){ imageData[iid] = s; t.images.push(iid); }
+      });
+      return normalizeTable(t);
+    });
+  }
+
+  /* called once a loaded table has been assigned to `table` */
+  function afterLoad(){
+    dirty = freshDirty();
+    dataVersion++;
+    tableToken++;
+    compactAllHistory();
+    if (table._needsFullWrite){
+      var legacy = table._legacyKey;
+      delete table._needsFullWrite;
+      delete table._legacyKey;
+      markMeta(); markAllRows(); markAllHist();
+      flushSave().then(function(){ if (legacy) deleteKeyChain(legacy); });
+    } else if (dirty.any){
+      scheduleSave();
+    }
+  }
+
   function newTableId(){ return 't' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
   function loadMetaOrCreateDefault(){
     return readKeyChain(META_KEY).then(function(stored){
       if (stored){
-        try {
-          var m = JSON.parse(stored);
-          if (m && Array.isArray(m.tables) && m.tables.length){
-            tables = m.tables;
-            currentTableId = tables.some(function(x){ return x.id === m.currentTableId; }) ? m.currentTableId : tables[0].id;
-            return;
-          }
-        } catch (e){}
+        var m = parseJson(stored, null);
+        if (m && Array.isArray(m.tables) && m.tables.length){
+          tables = m.tables;
+          currentTableId = tables.some(function(x){ return x.id === m.currentTableId; }) ? m.currentTableId : tables[0].id;
+          return;
+        }
       }
       var id = newTableId();
       var t = makeTemplate('footballer');
@@ -1813,7 +2186,8 @@
       currentTableId = id;
       table = normalizeTable(t);
       recordAllHistory();
-      return writeKeyChain(tableKey(id), JSON.stringify(table)).then(saveMeta);
+      dirty = freshDirty();
+      return writeBatchChain(fullPuts(id, table), []).then(saveMeta);
     });
   }
 
@@ -1942,22 +2316,195 @@
     return '<div class="cell"></div>';
   }
 
+  function colWidth(c){ return (typeof c.width === 'number' && c.width >= MIN_COL_W) ? c.width : defaultColWidth(c); }
+
+  function cellInner(row, col, maxMetric){
+    var v = row.c[col.id];
+    var isPrimary = col.id === table.primaryId;
+    switch (col.type){
+      case 'text':
+        return '<div class="cell' + (v ? '' : ' empty') + (isPrimary ? ' name-cell' : '') + '"><span class="val">' + (v ? esc(v) : 'Empty') + '</span></div>';
+      case 'number':
+        if (typeof v !== 'number') return '<div class="cell empty"><span class="val">Empty</span></div>';
+        if (col.id === table.metricId){
+          var pct = maxMetric > 0 ? Math.max(0, Math.min(100, v / maxMetric * 100)) : 0;
+          return '<div class="cell"><div class="score-wrap"><div class="score-bar" style="width:' + pct + '%;"></div><div class="score-num">' + esc(fmtNumber(v)) + '</div></div></div>';
+        }
+        return '<div class="cell"><span class="val num">' + esc(fmtNumber(v)) + '</span></div>';
+      case 'date':
+        return '<div class="cell' + (v ? '' : ' empty') + '"><span class="val">' + (v ? esc(fmtDate(v)) : 'Empty') + '</span></div>';
+      case 'checkbox':
+        return '<div class="cell"><span class="cell-check' + (v === true ? ' on' : '') + '" role="checkbox" aria-checked="' + (v === true) + '">' + (v === true ? SVG_CHECK : '') + '</span></div>';
+      case 'select':
+        var o = optById(col, v);
+        return '<div class="cell' + (o ? '' : ' empty') + '">' + (o ? tagHtml(o) : '<span class="val">Empty</span>') + '</div>';
+      case 'multiselect':
+        var ids = Array.isArray(v) ? v : [];
+        var tags = ids.map(function(id){ var x = optById(col, id); return x ? tagHtml(x) : ''; }).join('');
+        return '<div class="cell' + (tags ? '' : ' empty') + '">' + (tags ? '<div class="tags">' + tags + '</div>' : '<span class="val">Empty</span>') + '</div>';
+      case 'image':
+        return '<div class="cell">' + (v
+          ? '<span class="cell-img-wrap"><img class="cell-img" src="' + esc(v) + '" alt=""><button class="cell-img-clear" data-clear="1" title="Remove image" aria-label="Remove image">&times;</button></span>'
+          : '<span class="cell-img-add">+ Add</span>') + '</div>';
+      case 'country':
+        if (!v) return '<div class="cell empty"><span class="val">Empty</span></div>';
+        var fl = countryFlag(v);
+        return '<div class="cell"><span class="val" title="' + esc(v) + '">' + (fl || esc(v)) + '</span></div>';
+    }
+    return '<div class="cell"></div>';
+  }
+
+  function updateTableTitle(){
+    var t = tables.find(function(x){ return x.id === currentTableId; });
+    $('current-table-name').textContent = t ? t.name : 'Table';
+    document.title = (t ? t.name + ' \u00B7 ' : '') + 'Tables';
+  }
+
+
+  /* ---- cached view: sorted / filtered / grouped list of items ---- */
+  var itemsCache = {key: null, info: null};
+  var rowMapCache = {key: null, map: null};
+  var chromeCache = {group: null, filter: null, dupKey: null};
+  var ROW_H = 43, GROUP_H = 47;          // starting guesses; measured from the real page after the first render
+  var VIRT_MIN = 120;                    // above this many items only the visible window is drawn
+  var VIRT_BUFFER = 14;
+  var rendered = {start: 0, end: 0, virtual: false, maxMetric: 0};
+
+  function viewKey(){
+    var collapsed = [];
+    for (var k in view.collapsed) if (view.collapsed[k]) collapsed.push(k);
+    return [tableToken, dataVersion, view.query, view.sortColId, view.sortDir, view.groupColId, view.filterValue, collapsed.join('\u0001')].join('|');
+  }
+
+  function getRowMap(){
+    var key = tableToken + '|' + dataVersion;
+    if (rowMapCache.key !== key){
+      var m = {};
+      table.rows.forEach(function(r){ m[r.id] = r; });
+      rowMapCache = {key: key, map: m};
+    }
+    return rowMapCache.map;
+  }
+  function rowById(id){ return getRowMap()[id] || null; }
+
+  function getItems(){
+    var key = viewKey();
+    if (itemsCache.key === key) return itemsCache.info;
+    var groups = buildGroups(visibleRows());
+    var items = [];
+    groups.forEach(function(g){
+      if (g.key !== null){
+        var collapsed = !!view.collapsed[g.key];
+        items.push({t: 'g', g: g, collapsed: collapsed});
+        if (collapsed) return;
+      }
+      g.items.forEach(function(r){ items.push({t: 'r', row: r}); });
+    });
+    var maxMetric = 0;
+    if (table.metricId) table.rows.forEach(function(r){ var m = metricOf(r); if (m != null && m > maxMetric) maxMetric = m; });
+    var info = {items: items, maxMetric: maxMetric, offsets: null};
+    itemsCache = {key: key, info: info};
+    return info;
+  }
+
+  function computeOffsets(info){
+    if (info.offsets) return info.offsets;
+    var offs = new Array(info.items.length + 1);
+    var y = 0;
+    for (var i = 0; i < info.items.length; i++){
+      offs[i] = y;
+      y += info.items[i].t === 'g' ? GROUP_H : ROW_H;
+    }
+    offs[info.items.length] = y;
+    info.offsets = offs;
+    return offs;
+  }
+  function indexAt(offs, y){
+    var lo = 0, hi = offs.length - 2, ans = 0;
+    while (lo <= hi){
+      var mid = (lo + hi) >> 1;
+      if (offs[mid] <= y){ ans = mid; lo = mid + 1; } else { hi = mid - 1; }
+    }
+    return ans;
+  }
+  function visibleRange(info, buffer){
+    var offs = computeOffsets(info);
+    var tbody = $('grid-body');
+    var top = tbody ? tbody.getBoundingClientRect().top : 0;
+    var y0 = Math.max(0, -top), y1 = y0 + (window.innerHeight || 800);
+    var vs = indexAt(offs, y0), ve = Math.min(info.items.length, indexAt(offs, y1) + 1);
+    return {vs: vs, ve: ve, start: Math.max(0, vs - buffer), end: Math.min(info.items.length, ve + buffer)};
+  }
+
+  /* ---- html for rows ---- */
+  function cellInner(row, col, maxMetric){
+    var v = row.c[col.id];
+    var isPrimary = col.id === table.primaryId;
+    switch (col.type){
+      case 'text':
+        return '<div class="cell' + (v ? '' : ' empty') + (isPrimary ? ' name-cell' : '') + '"><span class="val">' + (v ? esc(v) : 'Empty') + '</span></div>';
+      case 'number':
+        if (typeof v !== 'number') return '<div class="cell empty"><span class="val">Empty</span></div>';
+        if (col.id === table.metricId){
+          var pct = maxMetric > 0 ? Math.max(0, Math.min(100, v / maxMetric * 100)) : 0;
+          return '<div class="cell"><div class="score-wrap"><div class="score-bar" style="width:' + pct + '%;"></div><div class="score-num">' + esc(fmtNumber(v)) + '</div></div></div>';
+        }
+        return '<div class="cell"><span class="val num">' + esc(fmtNumber(v)) + '</span></div>';
+      case 'date':
+        return '<div class="cell' + (v ? '' : ' empty') + '"><span class="val">' + (v ? esc(fmtDate(v)) : 'Empty') + '</span></div>';
+      case 'checkbox':
+        return '<div class="cell"><span class="cell-check' + (v === true ? ' on' : '') + '" role="checkbox" aria-checked="' + (v === true) + '">' + (v === true ? SVG_CHECK : '') + '</span></div>';
+      case 'select':
+        var o = optById(col, v);
+        return '<div class="cell' + (o ? '' : ' empty') + '">' + (o ? tagHtml(o) : '<span class="val">Empty</span>') + '</div>';
+      case 'multiselect':
+        var ids = Array.isArray(v) ? v : [];
+        var tags = ids.map(function(id){ var x = optById(col, id); return x ? tagHtml(x) : ''; }).join('');
+        return '<div class="cell' + (tags ? '' : ' empty') + '">' + (tags ? '<div class="tags">' + tags + '</div>' : '<span class="val">Empty</span>') + '</div>';
+      case 'image':
+        var src = imgSrc(v);
+        return '<div class="cell">' + (src
+          ? '<span class="cell-img-wrap"><img class="cell-img" src="' + esc(src) + '" alt=""><button class="cell-img-clear" data-clear="1" title="Remove image" aria-label="Remove image">&times;</button></span>'
+          : '<span class="cell-img-add">+ Add</span>') + '</div>';
+      case 'country':
+        if (!v) return '<div class="cell empty"><span class="val">Empty</span></div>';
+        var fl = countryFlag(v);
+        return '<div class="cell"><span class="val" title="' + esc(v) + '">' + (fl || esc(v)) + '</span></div>';
+    }
+    return '<div class="cell"></div>';
+  }
+
+  function rowCellsHtml(r, maxMetric){
+    var html = '';
+    table.columns.forEach(function(c){
+      html += '<td data-col="' + esc(c.id) + '">' + cellInner(r, c, maxMetric) + '</td>';
+    });
+    return html + '<td><div class="row-actions"><button class="del-btn" data-del="' + esc(r.id) + '" title="Delete row" aria-label="Delete row">' + SVG_TRASH + '</button></div></td><td class="spacer"></td>';
+  }
+  function rowTrHtml(r, maxMetric){
+    return '<tr class="player-row" data-row="' + esc(r.id) + '">' + rowCellsHtml(r, maxMetric) + '</tr>';
+  }
+  function groupHeaderInner(it){
+    var g = it.g;
+    return '<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>' +
+      groupIcon(g.col, g.key) +
+      '<span class="gname">' + esc(g.key) + '</span>' +
+      '<span class="gcount">' + g.items.length + (g.items.length === 1 ? ' row' : ' rows') + '</span>' +
+      (g.total != null ? '<span class="gtotal">&Sigma; ' + esc(fmtNumber(g.total)) + '</span>' : '');
+  }
+  function groupTrHtml(it, colspan){
+    return '<tr class="group-row"><td colspan="' + colspan + '"><div class="group-header' + (it.collapsed ? ' collapsed' : '') + '" data-group="' + esc(it.g.key) + '">' + groupHeaderInner(it) + '</div></td></tr>';
+  }
+  function spacerTrHtml(h, colspan){
+    return '<tr class="vspacer"><td colspan="' + colspan + '" style="height:' + Math.round(h) + 'px;"></td></tr>';
+  }
+
+  /* ---- drawing ---- */
   function render(){
     updateTableTitle();
     if (!table) return;
-    var host = $('table-card');
-    $('subtitle').textContent = table.rows.length + (table.rows.length === 1 ? ' row' : ' rows') + ' \u00B7 ' + table.columns.length + (table.columns.length === 1 ? ' column' : ' columns');
-    updateGroupControls();
-    updateDuplicateWarning();
-
-    var rows = visibleRows();
-    var groups = buildGroups(rows);
+    updateChrome();
     var sort = effectiveSort();
-    var maxMetric = 0;
-    if (table.metricId) table.rows.forEach(function(r){ var m = metricOf(r); if (m != null && m > maxMetric) maxMetric = m; });
-
-    var colspan = table.columns.length + 2;
-
     var html = '<table class="grid" style="width:100%;"><colgroup>';
     table.columns.forEach(function(c){ html += '<col style="width:' + colWidth(c) + 'px">'; });
     html += '<col style="width:56px"><col></colgroup><thead><tr>';
@@ -1969,68 +2516,149 @@
         (sorted ? '<span class="sort-arrow">' + (sort.dir === 'desc' ? '\u2193' : '\u2191') + '</span>' : '') +
         '</div><span class="col-resize" data-resize="' + esc(c.id) + '" title="Drag to resize \u00B7 double-click to reset"></span></th>';
     });
-    html += '<th class="add-col" id="add-col-th" title="Add a column"><span>+</span></th><th class="spacer"></th></tr></thead><tbody>';
-
-    if (!table.rows.length){
-      html += '<tr><td colspan="' + colspan + '"><div class="empty-state"><h3>No rows yet</h3><p>Add your first row to get started.</p><button class="btn btn-primary" id="empty-add-btn">+ Add row</button></div></td></tr>';
-    } else if (!rows.length){
-      html += '<tr><td colspan="' + colspan + '"><div class="empty-state"><h3>No matches</h3><p>No row matches \u201C' + esc(view.query) + '\u201D.</p></div></td></tr>';
-    } else {
-      groups.forEach(function(g){
-        if (g.key !== null){
-          var collapsed = !!view.collapsed[g.key];
-          html += '<tr class="group-row"><td colspan="' + colspan + '"><div class="group-header' + (collapsed ? ' collapsed' : '') + '" data-group="' + esc(g.key) + '">' +
-            '<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>' +
-            groupIcon(g.col, g.key) +
-            '<span class="gname">' + esc(g.key) + '</span>' +
-            '<span class="gcount">' + g.items.length + (g.items.length === 1 ? ' row' : ' rows') + '</span>' +
-            (g.total != null ? '<span class="gtotal">&Sigma; ' + esc(fmtNumber(g.total)) + '</span>' : '') +
-            '</div></td></tr>';
-          if (collapsed) return;
-        }
-        g.items.forEach(function(r){
-          html += '<tr class="player-row" data-row="' + esc(r.id) + '">';
-          table.columns.forEach(function(c){
-            html += '<td data-col="' + esc(c.id) + '">' + cellInner(r, c, maxMetric) + '</td>';
-          });
-          html += '<td><div class="row-actions"><button class="del-btn" data-del="' + esc(r.id) + '" title="Delete row" aria-label="Delete row">' + SVG_TRASH + '</button></div></td><td class="spacer"></td></tr>';
-        });
-      });
-    }
-    html += '</tbody></table>';
+    html += '<th class="add-col" id="add-col-th" title="Add a column"><span>+</span></th><th class="spacer"></th></tr></thead><tbody id="grid-body"></tbody></table>';
     html += '<div class="add-row" id="add-row-trigger"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>New row</div>';
-    host.innerHTML = html;
-    var empty = $('empty-add-btn');
-    if (empty) empty.addEventListener('click', addRow);
+    $('table-card').innerHTML = html;
+    renderBody();
   }
 
-  function updateTableTitle(){
-    var t = tables.find(function(x){ return x.id === currentTableId; });
-    $('current-table-name').textContent = t ? t.name : 'Table';
-    document.title = (t ? t.name + ' \u00B7 ' : '') + 'Tables';
+  /* draws just the rows (all of them, or only the visible window of a long table) */
+  function renderBody(skipMeasure){
+    var tbody = $('grid-body');
+    if (!tbody || !table) return;
+    var info = getItems(), items = info.items, colspan = table.columns.length + 2;
+    var html = '';
+    if (!table.rows.length){
+      html = '<tr><td colspan="' + colspan + '"><div class="empty-state"><h3>No rows yet</h3><p>Add your first row to get started.</p><button class="btn btn-primary" id="empty-add-btn">+ Add row</button></div></td></tr>';
+      rendered = {start: 0, end: 0, virtual: false, maxMetric: info.maxMetric};
+    } else if (!items.length){
+      html = '<tr><td colspan="' + colspan + '"><div class="empty-state"><h3>No matches</h3><p>No row matches \u201C' + esc(view.query) + '\u201D.</p></div></td></tr>';
+      rendered = {start: 0, end: 0, virtual: false, maxMetric: info.maxMetric};
+    } else {
+      var virtual = items.length > VIRT_MIN, start = 0, end = items.length, offs = null;
+      if (virtual){
+        offs = computeOffsets(info);
+        var rg = visibleRange(info, VIRT_BUFFER);
+        start = rg.start; end = rg.end;
+        if (start > 0) html += spacerTrHtml(offs[start], colspan);
+      }
+      for (var i = start; i < end; i++){
+        var it = items[i];
+        html += it.t === 'g' ? groupTrHtml(it, colspan) : rowTrHtml(it.row, info.maxMetric);
+      }
+      if (virtual && end < items.length) html += spacerTrHtml(offs[items.length] - offs[end], colspan);
+      rendered = {start: start, end: end, virtual: virtual, maxMetric: info.maxMetric};
+    }
+    tbody.innerHTML = html;
+    var empty = $('empty-add-btn');
+    if (empty) empty.addEventListener('click', addRow);
+    if (!skipMeasure) measureHeights();
+  }
+
+  /* learn the real row heights so the scroll math for long tables is exact */
+  function measureHeights(){
+    var changed = false;
+    var tr = document.querySelector('#grid-body tr.player-row');
+    var gr = document.querySelector('#grid-body tr.group-row');
+    if (tr){ var h = tr.getBoundingClientRect().height; if (h > 10 && Math.abs(h - ROW_H) > 0.4){ ROW_H = h; changed = true; } }
+    if (gr){ var g = gr.getBoundingClientRect().height; if (g > 10 && Math.abs(g - GROUP_H) > 0.4){ GROUP_H = g; changed = true; } }
+    if (changed){
+      if (itemsCache.info) itemsCache.info.offsets = null;
+      if (rendered.virtual) renderBody(true);
+    }
+  }
+
+  /* keep the drawn window in step with the scroll position */
+  var scrollTick = false;
+  function onScrollOrResize(){
+    if (!rendered.virtual || scrollTick) return;
+    scrollTick = true;
+    requestAnimationFrame(function(){
+      scrollTick = false;
+      if (!rendered.virtual || !table) return;
+      var ae = document.activeElement;
+      if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'SELECT') && $('grid-body') && $('grid-body').contains(ae)) return;
+      var info = getItems();
+      var r = visibleRange(info, 0);
+      if ((r.vs < rendered.start + 3 && rendered.start > 0) || (r.ve > rendered.end - 3 && rendered.end < info.items.length)) renderBody();
+    });
+  }
+
+  /* ---- changing one row without rebuilding the others ---- */
+  function sameOrder(a, b){
+    if (!a || !b || a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++){
+      var x = a[i], y = b[i];
+      if (x.t !== y.t) return false;
+      if (x.t === 'r'){ if (x.row.id !== y.row.id) return false; }
+      else if (x.g.key !== y.g.key || x.collapsed !== y.collapsed) return false;
+    }
+    return true;
+  }
+  function refreshBars(info){
+    rendered.maxMetric = info.maxMetric;
+    if (!table.metricId) return;
+    var map = getRowMap();
+    Array.prototype.forEach.call(document.querySelectorAll('#grid-body tr[data-row]'), function(tr){
+      var bar = tr.querySelector('td[data-col="' + table.metricId + '"] .score-bar');
+      if (!bar) return;
+      var r = map[tr.getAttribute('data-row')];
+      var m = r ? metricOf(r) : null;
+      bar.style.width = (m != null && info.maxMetric > 0 ? Math.max(0, Math.min(100, m / info.maxMetric * 100)) : 0) + '%';
+    });
+  }
+  function refreshGroupHeaders(info){
+    var byKey = {};
+    info.items.forEach(function(it){ if (it.t === 'g') byKey[it.g.key] = it; });
+    Array.prototype.forEach.call(document.querySelectorAll('#grid-body .group-header'), function(gh){
+      var it = byKey[gh.getAttribute('data-group')];
+      if (it) gh.innerHTML = groupHeaderInner(it);
+    });
+  }
+  function afterEdit(row){
+    var prev = itemsCache.info ? itemsCache.info.items : null;
+    var info = getItems();
+    if (!sameOrder(prev, info.items)){ renderBody(); updateChrome(); return; }
+    var tr = document.querySelector('#grid-body tr[data-row="' + row.id + '"]');
+    if (tr) tr.innerHTML = rowCellsHtml(row, info.maxMetric);
+    if (info.maxMetric !== rendered.maxMetric) refreshBars(info);
+    refreshGroupHeaders(info);
+    updateChrome();
+  }
+
+  /* ---- toolbar / banner bits that only change when the data does ---- */
+  function updateChrome(){
+    $('subtitle').textContent = table.rows.length + (table.rows.length === 1 ? ' row' : ' rows') + ' \u00B7 ' + table.columns.length + (table.columns.length === 1 ? ' column' : ' columns');
+    updateGroupControls();
+    updateDuplicateWarning();
   }
 
   function updateGroupControls(){
     var gs = $('group-select');
     var cols = groupableCols();
     if (view.groupColId && !cols.some(function(c){ return c.id === view.groupColId; })){ view.groupColId = ''; view.filterValue = 'all'; }
-    var html = '<option value="">None</option>' + cols.map(function(c){
+    var ghtml = '<option value="">None</option>' + cols.map(function(c){
       return '<option value="' + esc(c.id) + '"' + (c.id === view.groupColId ? ' selected' : '') + '>' + esc(c.name) + '</option>';
     }).join('');
-    gs.innerHTML = html;
+    if (ghtml !== chromeCache.group){ gs.innerHTML = ghtml; chromeCache.group = ghtml; }
     var fs = $('filter-select');
     var col = view.groupColId && colById(view.groupColId);
-    if (!col){ fs.style.display = 'none'; return; }
+    if (!col){ fs.style.display = 'none'; chromeCache.filter = null; return; }
     var keys = uniqueGroupKeys(col);
     if (view.filterValue !== 'all' && keys.indexOf(view.filterValue) === -1 && view.filterValue !== 'Unspecified') view.filterValue = 'all';
-    fs.innerHTML = '<option value="all">All ' + esc(col.name) + '</option>' + keys.map(function(k){
-      return '<option value="' + esc(k) + '"' + (k === view.filterValue ? ' selected' : '') + '>' + esc(k) + '</option>';
+    var fhtml = '<option value="all">All ' + esc(col.name) + '</option>' + keys.map(function(k){
+      return '<option value="' + esc(k) + '">' + esc(k) + '</option>';
     }).join('');
-    fs.value = view.filterValue;
+    // only rebuild the list when its contents changed, so an open dropdown isn't closed under you
+    if (fhtml !== chromeCache.filter){ fs.innerHTML = fhtml; chromeCache.filter = fhtml; }
+    if (fs.value !== view.filterValue) fs.value = view.filterValue;
     fs.style.display = 'inline-block';
   }
 
   function updateDuplicateWarning(){
+    var key = tableToken + '|' + dataVersion + '|' + table.primaryId;
+    if (chromeCache.dupKey === key) return;
+    chromeCache.dupKey = key;
     var bar = $('duplicate-warning');
     var pc = primaryCol();
     var seen = {}, dups = [];
@@ -2049,13 +2677,12 @@
   }
 
   /* ================= editing cells ================= */
-  function rowById(id){ return table.rows.find(function(r){ return r.id === id; }) || null; }
-
   function commitCell(row, col, value){
     row.c[col.id] = value;
     recordHistory(row);
+    markRow(row.id);
     scheduleSave();
-    render();
+    afterEdit(row);
   }
 
   function onTbodyClick(e){
@@ -2132,18 +2759,31 @@
   }
 
   function addRow(){
-    if (!table.columns.length) return;
+    if (!table || !table.columns.length) return;
     var r = {id: uid(), c: {}};
     table.columns.forEach(function(c){ r.c[c.id] = emptyValue(c.type); });
     table.rows.push(r);
     view.query = ''; $('search-input').value = ''; $('clear-search-btn').style.display = 'none';
     view.filterValue = 'all';
     recordHistory(r);
+    markRow(r.id);
     scheduleSave();
     render();
     var pc = primaryCol();
     if (pc && pc.type === 'text'){
-      var td = document.querySelector('tr[data-row="' + r.id + '"] td[data-col="' + pc.id + '"]');
+      var sel = 'tr[data-row="' + r.id + '"] td[data-col="' + pc.id + '"]';
+      var td = document.querySelector(sel);
+      if (!td && rendered.virtual){
+        // long table: jump to the new row first so it gets drawn
+        var info = getItems();
+        var idx = info.items.findIndex(function(it){ return it.t === 'r' && it.row.id === r.id; });
+        if (idx >= 0){
+          var offs = computeOffsets(info);
+          window.scrollTo(0, Math.max(0, $('grid-body').getBoundingClientRect().top + window.pageYOffset + offs[idx] - (window.innerHeight || 800) / 2));
+          renderBody();
+          td = document.querySelector(sel);
+        }
+      }
       if (td){ td.scrollIntoView({block: 'nearest'}); beginInlineEdit(td, r, pc); }
     }
   }
@@ -2154,6 +2794,7 @@
     if (!confirm('Delete \u201C' + rowLabel(r) + '\u201D from this table?')) return;
     markDeleted(r);
     table.rows = table.rows.filter(function(x){ return x.id !== id; });
+    markRow(id);
     scheduleSave();
     render();
   }
@@ -2208,7 +2849,7 @@
         var i = arr.indexOf(id);
         if (i === -1) arr.push(id); else arr.splice(i, 1);
         row.c[col.id] = arr;
-        recordHistory(row); scheduleSave(); render(); draw();
+        recordHistory(row); markRow(row.id); scheduleSave(); afterEdit(row); draw();
       } else {
         closePopover();
         commitCell(row, col, id);
@@ -2314,7 +2955,8 @@
   function changeColumnType(col, newType){
     if (col.type === newType) return;
     convertColumn(col, newType);
-    if (col.id === table.metricId && newType !== 'number'){ table.metricId = null; table.history = {}; }
+    if (col.id === table.metricId && newType !== 'number'){ table.metricId = null; resetHistory(); }
+    markAllRows();
     if (col.id === table.primaryId && newType !== 'text'){
       var alt = table.columns.find(function(c){ return c !== col && c.type === 'text'; });
       table.primaryId = alt ? alt.id : table.primaryId;
@@ -2332,7 +2974,7 @@
         !confirm('Switching the metric starts a new history; trends and past-date rankings for the previous metric will be cleared. Continue?')) return;
     if (!colId && hasHistory && !confirm('Stop using this column for rankings & trends? Its recorded history will be cleared.')) return;
     table.metricId = colId;
-    table.history = {};
+    resetHistory();
     recordAllHistory();
     if (view.sortColId && !colById(view.sortColId)) view.sortColId = '';
     scheduleSave();
@@ -2344,11 +2986,12 @@
     if (!confirm('Delete the column \u201C' + col.name + '\u201D and all of its values? This cannot be undone.')) return;
     table.columns = table.columns.filter(function(c){ return c !== col; });
     table.rows.forEach(function(r){ delete r.c[col.id]; });
+    markAllRows();
     if (table.primaryId === col.id){
       var p = table.columns.find(function(c){ return c.type === 'text'; }) || table.columns[0];
       table.primaryId = p.id;
     }
-    if (table.metricId === col.id){ table.metricId = null; table.history = {}; }
+    if (table.metricId === col.id){ table.metricId = null; resetHistory(); }
     if (view.sortColId === col.id) view.sortColId = '';
     if (view.groupColId === col.id){ view.groupColId = ''; view.filterValue = 'all'; }
     recordAllHistory();
@@ -2403,7 +3046,7 @@
     var body = openDialog('Options \u2014 ' + col.name, false);
     dlgOnClose = function(){
       col.options = col.options.filter(function(o){ return o.label.trim(); });
-      recordAllHistory(); scheduleSave(); render();
+      markAllRows(); recordAllHistory(); scheduleSave(); render();
     };
     function draw(){
       var html = '<p class="dlg-hint">Each option can have a color' + (col.type === 'select' ? ' and an optional logo' : '') + '. Renaming an option updates every row that uses it.</p><div id="opt-rows">';
@@ -2412,7 +3055,7 @@
         html += '<div class="opt-row" data-opt="' + esc(o.id) + '">' +
           '<button class="opt-color" data-act="color" title="Change color" style="background:' + p.bg + ';box-shadow:0 0 0 2px ' + p.fg + ';"></button>' +
           '<input class="opt-label" value="' + esc(o.label) + '" placeholder="Option name">' +
-          '<button class="opt-logo" data-act="logo" title="' + (o.img ? 'Replace logo' : 'Add a logo') + '">' + (o.img ? '<img src="' + esc(o.img) + '" alt="">' : '+') + '</button>' +
+          '<button class="opt-logo" data-act="logo" title="' + (o.img ? 'Replace logo' : 'Add a logo') + '">' + (o.img && imgSrc(o.img) ? '<img src="' + esc(imgSrc(o.img)) + '" alt="">' : '+') + '</button>' +
           (o.img ? '<button class="opt-x" data-act="clear-logo" title="Remove logo">&#8856;</button>' : '') +
           '<button class="opt-x" data-act="remove" title="Delete option">&times;</button></div>';
       });
@@ -2459,23 +3102,14 @@
   var optionsEditorRedraw = null;
 
   /* ---- image upload (cells and option logos) ---- */
+  /* read a chosen file and shrink it to the compact stored size */
   function resizeImageToDataURL(file, maxDim, callback){
     var reader = new FileReader();
     reader.onload = function(evt){
       var img = new Image();
       img.onload = function(){
-        var w = img.naturalWidth || img.width;
-        var h = img.naturalHeight || img.height;
-        var scale = Math.min(1, maxDim / Math.max(w, h));
-        var tw = Math.max(1, Math.round(w * scale));
-        var th = Math.max(1, Math.round(h * scale));
-        var canvas = document.createElement('canvas');
-        canvas.width = tw; canvas.height = th;
-        var ctx = canvas.getContext('2d');
-        ctx.clearRect(0, 0, tw, th);
-        ctx.drawImage(img, 0, 0, tw, th);
         var out;
-        try { out = canvas.toDataURL('image/png'); }
+        try { out = encodeImage(img, maxDim); }
         catch (err){ out = evt.target.result; }
         callback(out);
       };
@@ -2496,15 +3130,16 @@
       e.target.value = '';
       return;
     }
-    resizeImageToDataURL(file, 160, function(url){
+    resizeImageToDataURL(file, IMG_MAX, function(url){
       e.target.value = '';
       if (!url){ alert('Could not read that image file.'); return; }
+      var imgId = internImage(url);
       if (target.kind === 'cell'){
         var row = rowById(target.rowId), col = colById(target.colId);
-        if (row && col) commitCell(row, col, url);
+        if (row && col) commitCell(row, col, imgId);
       } else {
         var c = colById(target.colId), o = c && optById(c, target.optId);
-        if (o){ o.img = url; scheduleSave(); if (optionsEditorRedraw && dialogOpen()) optionsEditorRedraw(); }
+        if (o){ o.img = imgId; scheduleSave(); if (optionsEditorRedraw && dialogOpen()) optionsEditorRedraw(); render(); }
       }
     });
   }
@@ -2618,6 +3253,7 @@
   }
 
   function openRankings(){
+    if (!table) return;
     rankingsState.open = true;
     $('rankings-overlay').style.display = 'flex';
     var di = $('rankings-date');
@@ -2634,57 +3270,72 @@
   var TREND_COLORS = ['#2F7A4D', '#3B6FD4', '#D9822B', '#A855A8', '#C0392B', '#0E9AA7', '#8A6D1F', '#6B7280'];
   var TREND_MAX_SERIES = 8;
 
-  function seriesValueAt(s, T){
-    if (s.kind === 'row'){
-      var arr = table.history[s.key];
-      if (!arr) return null;
-      var sn = latestSnapAt(arr, T);
-      return (sn && !sn.del) ? sn.m : null;
-    }
-    var sum = 0, count = 0;
+  /* All snapshots across the table, oldest first. Built once per data change and shared by every line. */
+  var eventsCache = {key: null, events: null};
+  function allEvents(){
+    var key = tableToken + '|' + dataVersion;
+    if (eventsCache.key === key) return eventsCache.events;
+    var ev = [];
     Object.keys(table.history).forEach(function(id){
-      var x = latestSnapAt(table.history[id], T);
-      if (x && !x.del && x.m != null && x.g && x.g[s.kind] === s.key){ sum += x.m; count++; }
+      var arr = table.history[id];
+      for (var i = 0; i < arr.length; i++) ev.push({t: arr[i].t, id: id, i: i});
     });
-    if (!count) return null;
-    return trendState.metric === 'avg' ? sum / count : sum;
+    ev.sort(function(a, b){ return a.t - b.t; });
+    eventsCache = {key: key, events: ev};
+    return ev;
   }
 
-  function seriesEventTimes(s, from, to){
-    var buckets = {};
-    function add(t){
-      if (t <= from || t >= to) return;
-      var b = Math.floor(t / 60000);
-      buckets[b] = Math.min((b + 1) * 60000 - 1, to - 1);
+  /* One line for a single row: walk its own snapshots once. */
+  function rowSeriesPoints(s, from, to){
+    var arr = table.history[s.key] || [];
+    var cur = null, i = 0, n = arr.length;
+    function val(sn){ return sn.del ? null : sn.m; }
+    while (i < n && arr[i].t <= from){ cur = val(arr[i]); i++; }
+    var pts = [{t: from, v: cur, edge: true}];
+    while (i < n && arr[i].t < to){
+      var b = Math.floor(arr[i].t / 60000);
+      while (i < n && arr[i].t < to && Math.floor(arr[i].t / 60000) === b){ cur = val(arr[i]); i++; }
+      if (cur !== pts[pts.length - 1].v) pts.push({t: Math.min((b + 1) * 60000 - 1, to - 1), v: cur, edge: false});
     }
-    if (s.kind === 'row'){
-      (table.history[s.key] || []).forEach(function(sn){ add(sn.t); });
-    } else {
-      Object.keys(table.history).forEach(function(id){
-        var arr = table.history[id];
-        for (var i = 0; i < arr.length; i++){
-          var here = arr[i].g && arr[i].g[s.kind] === s.key;
-          var before = i > 0 && arr[i - 1].g && arr[i - 1].g[s.kind] === s.key;
-          if (here || before) add(arr[i].t);
-        }
-      });
+    pts.push({t: to, v: cur, edge: true});
+    return pts;
+  }
+
+  /* One line for a category: sweep through all snapshots once, keeping a running total. */
+  function groupSeriesPoints(s, from, to){
+    var events = allEvents(), kind = s.kind, key = s.key;
+    var contrib = {}, sum = 0, count = 0;
+    function apply(e){
+      var sn = table.history[e.id][e.i];
+      if (contrib[e.id] !== undefined){ sum -= contrib[e.id]; count--; delete contrib[e.id]; }
+      if (!sn.del && sn.m != null && sn.g && sn.g[kind] === key){ contrib[e.id] = sn.m; sum += sn.m; count++; }
     }
-    return Object.keys(buckets).map(function(b){ return buckets[b]; })
-      .sort(function(a, b){ return a - b; })
-      .filter(function(t, i, a){ return i === 0 || t !== a[i - 1]; });
+    function value(){ return count ? (trendState.metric === 'avg' ? sum / count : sum) : null; }
+    var i = 0, n = events.length;
+    while (i < n && events[i].t <= from){ apply(events[i]); i++; }
+    var pts = [{t: from, v: value(), edge: true}];
+    while (i < n && events[i].t < to){
+      var b = Math.floor(events[i].t / 60000);
+      while (i < n && events[i].t < to && Math.floor(events[i].t / 60000) === b){ apply(events[i]); i++; }
+      var v = value();
+      if (v !== pts[pts.length - 1].v) pts.push({t: Math.min((b + 1) * 60000 - 1, to - 1), v: v, edge: false});
+    }
+    pts.push({t: to, v: value(), edge: true});
+    return pts;
   }
 
   function seriesPoints(s, from, to){
-    var times = [from].concat(seriesEventTimes(s, from, to)).concat([to]);
-    var pts = [];
-    times.forEach(function(t, i){
-      var v = seriesValueAt(s, t);
-      var edge = i === 0 || i === times.length - 1;
-      var prev = pts[pts.length - 1];
-      if (!edge && prev && prev.v === v) return;
-      pts.push({t: t, v: v, edge: edge});
-    });
-    return pts;
+    return s.kind === 'row' ? rowSeriesPoints(s, from, to) : groupSeriesPoints(s, from, to);
+  }
+
+  /* the value of a line at time T, read from its precomputed points (no re-scanning the history) */
+  function valueFromPts(pts, T){
+    var lo = 0, hi = pts.length - 1, ans = 0;
+    while (lo <= hi){
+      var mid = (lo + hi) >> 1;
+      if (pts[mid].t <= T){ ans = mid; lo = mid + 1; } else { hi = mid - 1; }
+    }
+    return pts[ans].v;
   }
 
   function niceNum(range, round){
@@ -2960,7 +3611,7 @@
       hv.style.display = 'block';
       var rows = '';
       data.forEach(function(d, i){
-        var v = seriesValueAt(d.s, T);
+        var v = valueFromPts(d.pts, T);
         var dot = $('trend-hover-dot-' + i);
         if (v == null){ dot.style.display = 'none'; }
         else { dot.setAttribute('cx', hx); dot.setAttribute('cy', Y(v).toFixed(1)); dot.style.display = 'block'; }
@@ -2979,6 +3630,7 @@
   }
 
   function openTrends(){
+    if (!table) return;
     trendState.open = true;
     $('trends-overlay').style.display = 'flex';
     var today = todayStr();
@@ -3011,10 +3663,12 @@
   }
 
   function enterTable(id){
+    table = null;
     $('table-card').innerHTML = '<div class="empty-state"><h3>Loading\u2026</h3></div>';
     resetViewForTable();
     return loadTable(id).then(function(t){
       table = t;
+      afterLoad();
       render();
     });
   }
@@ -3029,11 +3683,17 @@
     });
   }
 
-  function addTableFromData(name, data){
+  function addTableFromData(name, data, imagesMap){
     return flushSave().then(function(){
+      if (imagesMap){
+        Object.keys(imagesMap).forEach(function(id){
+          if (isImageId(id) && isDataImage(imagesMap[id])) imageData[id] = imagesMap[id];
+        });
+      }
+      return internInlineImages(normalizeTable(data));
+    }).then(function(t){
       var id = newTableId();
-      var t = normalizeTable(data);
-      return writeKeyChain(tableKey(id), JSON.stringify(t)).then(function(){
+      return writeBatchChain(fullPuts(id, t), []).then(function(){
         tables.push({id: id, name: name, createdAt: Date.now()});
         currentTableId = id;
         return saveMeta();
@@ -3094,10 +3754,11 @@
     var t = tables.find(function(x){ return x.id === currentTableId; });
     if (!t) return;
     if (!confirm('Delete \u201C' + t.name + '\u201D and its ' + table.rows.length + ' rows? This cannot be undone.')) return;
-    var gone = currentTableId;
+    var gone = currentTableId, goneTable = table;
     tables = tables.filter(function(x){ return x.id !== gone; });
-    dirty = false;
-    deleteKeyChain(tableKey(gone));
+    clearTimeout(saveTimer);
+    dirty = freshDirty();
+    writeBatchChain([], allKeysOf(gone, goneTable));
     currentTableId = tables[0].id;
     saveMeta();
     closeTableMenu();
@@ -3140,7 +3801,14 @@
   function safeFileName(s){ return String(s).replace(/[^\w\-]+/g, '_').replace(/^_+|_+$/g, '') || 'table'; }
 
   function exportJson(){
-    var data = {format: 'tables-app', version: 1, name: currentTableName(), table: table};
+    if (!table) return;
+    var refs = referencedImages(table), images = {};
+    Object.keys(refs).forEach(function(id){ if (imageData[id]) images[id] = imageData[id]; });
+    var data = {
+      format: 'tables-app', version: 2, name: currentTableName(),
+      table: {columns: table.columns, rows: table.rows, primaryId: table.primaryId, metricId: table.metricId, history: table.history},
+      images: images
+    };
     downloadFile(safeFileName(currentTableName()) + '-' + todayStr() + '.json', JSON.stringify(data, null, 2), 'application/json');
   }
 
@@ -3176,7 +3844,7 @@
       try {
         var parsed = JSON.parse(evt.target.result);
         if (parsed && parsed.format === 'tables-app' && parsed.table){
-          addTableFromData(parsed.name || 'Imported table', parsed.table);
+          addTableFromData(parsed.name || 'Imported table', parsed.table, parsed.images);
         } else if (Array.isArray(parsed) || (parsed && Array.isArray(parsed.players))){
           addTableFromData('Footballer roster (imported)', legacyToTable(parsed));
         } else {
@@ -3350,7 +4018,9 @@
       if (rankingsState.open) closeRankings();
       if (tableMenuOpen) closeTableMenu();
     });
-    window.addEventListener('pagehide', function(){ if (dirty) saveTableNow(); });
+    window.addEventListener('scroll', onScrollOrResize, {passive: true});
+    window.addEventListener('resize', onScrollOrResize);
+    window.addEventListener('pagehide', function(){ if (dirty.any) saveTableNow(); });
     document.addEventListener('visibilitychange', function(){ if (document.visibilityState === 'hidden') flushSave(); });
   }
 
@@ -3361,6 +4031,7 @@
     return table || loadTable(currentTableId);
   }).then(function(t){
     table = t;
+    afterLoad();
     render();
   });
 
